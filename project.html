@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Chaotic + Fibonacci Q-Matrix Image Encrypt</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{
+    font-family:system-ui,Roboto,Arial,sans-serif;
+    padding:12px;
+    background:#f7f8fb;
+  }
+  .card{
+    background:#fff;
+    padding:12px;
+    border-radius:8px;
+    margin-bottom:10px;
+    box-shadow:0 4px 12px rgba(0,0,0,0.06);
+  }
+  label{margin-right:8px;font-size:14px}
+  canvas{
+    border:1px solid #ddd;
+    display:block;
+    margin-top:8px;
+    max-width:100%;
+  }
+  textarea{
+    width:100%;
+    height:56px;
+    font-family:monospace;
+    font-size:13px;
+  }
+  button{
+    padding:8px 12px;
+    border-radius:6px;
+    border:0;
+    background:#2563eb;
+    color:#fff;
+    cursor:pointer;
+    font-size:13px;
+    margin-right:6px;
+  }
+  button.secondary{
+    background:#6b7280;
+  }
+  button:disabled{
+    opacity:0.5;
+    cursor:not-allowed;
+  }
+  .small{
+    font-size:12px;
+    color:#555;
+  }
+</style>
+</head>
+<body>
+
+<h2>Chaotic + Fibonacci Q-Matrix Image Encrypt</h2>
+
+<div class="card">
+  <label>Image:
+    <input id="file" type="file" accept="image/*">
+  </label>
+  
+  <div style="margin-top:8px;">
+    <button id="enc">Encrypt</button>
+    <button id="dec">Decrypt</button>
+    <button id="downEnc" class="secondary">Download Encrypted</button>
+  </div>
+  <div class="small" style="margin-top:6px;">
+    Load an image, then click Encrypt. Use the same key to Decrypt.
+  </div>
+</div>
+
+<div class="card">
+  <div><strong>Canvas</strong></div>
+  <canvas id="c" width="512" height="512"></canvas>
+</div>
+
+<div class="card">
+  <div><strong>Key</strong></div>
+  <textarea id="key" placeholder="Hex key (auto-generated or paste your own)"></textarea>
+  <div style="margin-top:8px;">
+    <input id="keyfile" type="file" accept=".key,.txt,.json">
+    <button id="dlKey" class="secondary">Download Key</button>
+  </div>
+  <div id="info" style="margin-top:8px;color:#333">Info: —</div>
+  <div class="small" style="margin-top:4px;">
+    Internals: key → chaotic logistic map, Fibonacci Q-matrix permutation, modular addition diffusion.
+  </div>
+</div>
+
+<script>
+/* ---------------- Basic setup ---------------- */
+const c   = document.getElementById('c');
+const ctx = c.getContext('2d');
+const fileInp  = document.getElementById('file');
+const keyBox   = document.getElementById('key');
+const info     = document.getElementById('info');
+
+let originalImageData = null;   // original pixels
+let lastEncryptedData = null;   // last encrypted image
+
+/* ---------------- Helpers ---------------- */
+function bufToHex(u8){
+  return Array.from(u8).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+function hexToBytes(hex){
+  hex = hex.trim();
+  if(hex.length % 2 !== 0) throw new Error("Invalid hex length");
+  const out = new Uint8Array(hex.length/2);
+  
+  for(let i=0;i<hex.length;i+=2){
+    const byte = parseInt(hex.slice(i,i+2),16);
+    if(Number.isNaN(byte)) throw new Error("Invalid hex char");
+    out[i/2] = byte;
+  }
+  return out;
+}
+
+function generateRandomHexKey(lenBytes=16){
+  const arr = new Uint8Array(lenBytes);
+  if(window.crypto && crypto.getRandomValues){
+    crypto.getRandomValues(arr);
+  }else{
+    // fallback (not cryptographically strong, but fine as backup)
+    for(let i=0;i<lenBytes;i++) arr[i] = Math.floor(Math.random()*256);
+  }
+  return bufToHex(arr);
+}
+
+/* ------------- Derive parameters from key -------------
+   We derive:
+   - x0, r  : for logistic chaotic map
+   - fibN0  : starting exponent for Fibonacci Q-matrix
+*/
+function deriveParamsFromKey(hex){
+  const bytes = hexToBytes(hex);
+  if(bytes.length < 8){
+    throw new Error("Key too short (need at least 8 bytes)");
+  }
+
+  // x0 in (0,1)
+  const x0 = (bytes[0] + 1) / 257; // (1..256)/257
+
+  // r in [3.9, 3.99]
+  const r  = 3.9 + (bytes[1] / 255) * 0.09;
+
+  // fibN0 from 4 bytes
+  const fibN0 = (
+    (bytes[2] << 24) |
+    (bytes[3] << 16) |
+    (bytes[4] << 8)  |
+    (bytes[5])
+  ) >>> 0; // unsigned
+
+  // for safety, avoid 0
+  const fibStart = fibN0 === 0 ? 1 : fibN0;
+
+  return { x0, r, fibStart };
+}
+
+/* ------------- Chaotic map keystream (logistic map) -------------
+   x_{n+1} = r * x_n * (1 - x_n)
+*/
+function genChaosStream(length, x0, r){
+  const ks = new Uint8Array(length);
+  let x = x0;
+  for(let i=0;i<length;i++){
+    x = r * x * (1 - x);
+    // avoid degenerate 0 or 1
+    if(x <= 0 || x >= 1){
+      x = (x0 + 0.123456) % 1;
+      if(x === 0) x = 0.5;
+    }
+    ks[i] = (x * 256) & 0xFF;
+  }
+  return ks;
+}
+
+/* ------------- Fibonacci Q-matrix permutation -------------
+   Q = [[1,1],[1,0]]
+   Q^n = [[F_{n+1}, F_n],[F_n, F_{n-1}]]
+
+   We use:
+   - mod = totalPixels
+   - starting exponent = fibStart
+   - keep multiplying by Q to advance Fibonacci index
+   - use F_n mod totalPixels as "candidate index"
+   - build a permutation array from these candidates
+*/
+function fibQPermutation(totalPixels, fibStart){
+  const total = totalPixels;
+  const mod   = BigInt(total);
+
+  // 2x2 matrix helpers over BigInt with modulo
+  function matMul(A,B){
+    return [
+      [
+        (A[0][0]*B[0][0] + A[0][1]*B[1][0]) % mod,
+        (A[0][0]*B[0][1] + A[0][1]*B[1][1]) % mod
+      ],
+      [
+        (A[1][0]*B[0][0] + A[1][1]*B[1][0]) % mod,
+        (A[1][0]*B[0][1] + A[1][1]*B[1][1]) % mod
+      ]
+    ];
+  }
+
+  function matPow(base, exp){
+    let result = [
+      [1n,0n],
+      [0n,1n]
+    ];
+    let b = base;
+    let e = BigInt(exp);
+    while(e > 0n){
+      if(e & 1n) result = matMul(result,b);
+      b = matMul(b,b);
+      e >>= 1n;
+    }
+    return result;
+  }
+
+  const Q = [
+    [1n,1n],
+    [1n,0n]
+  ];
+
+  // Q^fibStart
+  let M = matPow(Q, fibStart);
+
+  const used = new Uint8Array(total);
+  const perm = new Uint32Array(total);
+  let cnt = 0;
+  let iter = 0;
+  const maxIter = total * 10; // safety cap
+
+  while(cnt < total && iter < maxIter){
+    const Fn = M[0][1];              // F_n
+    const candidate = Number(Fn % mod);
+    if(!used[candidate]){
+      used[candidate] = 1;
+      perm[cnt++] = candidate;
+    }
+    // advance Fibonacci index: multiply by Q once
+    M = matMul(M, Q);
+    iter++;
+  }
+
+  // If some indices not covered due to repeats, fill remaining sequentially
+  if(cnt < total){
+    for(let i=0;i<total;i++){
+      if(!used[i]){
+        perm[cnt++] = i;
+        if(cnt === total) break;
+      }
+    }
+  }
+
+  return perm;
+}
+
+/* ------------- Encryption and decryption core ------------- */
+
+function encryptImageData(imgData, params){
+  const w = imgData.width;
+  const h = imgData.height;
+  const total = w * h;
+
+  const src = new Uint8ClampedArray(imgData.data);
+  const out = new Uint8ClampedArray(src.length);
+
+  // 1) Build permutation using Fibonacci Q-matrix
+  const perm = fibQPermutation(total, params.fibStart);
+
+  // 2) Chaotic keystream for diffusion (R,G,B for each pixel)
+  const ks = genChaosStream(total * 3, params.x0, params.r);
+
+  // 3) Permutation + modular addition diffusion
+  for(let i=0;i<total;i++){
+    const dstIdx = perm[i];   // where this pixel goes
+    const ksBase = i * 3;
+
+    const r = (src[i*4    ] + ks[ksBase  ]) & 0xFF;
+    const g = (src[i*4 + 1] + ks[ksBase+1]) & 0xFF;
+    const b = (src[i*4 + 2] + ks[ksBase+2]) & 0xFF;
+    const a =  src[i*4 + 3];
+
+    out[dstIdx*4    ] = r;
+    out[dstIdx*4 + 1] = g;
+    out[dstIdx*4 + 2] = b;
+    out[dstIdx*4 + 3] = a;
+  }
+
+  return {
+    imageData: new ImageData(out, w, h),
+    perm      // return permutation so we can rebuild inverse if needed (but we will recompute in decrypt using same params)
+  };
+}
+
+function decryptImageData(encData, params){
+  const w = encData.width;
+  const h = encData.height;
+  const total = w * h;
+
+  const src = new Uint8ClampedArray(encData.data);
+  const out = new Uint8ClampedArray(src.length);
+
+  // Rebuild the same permutation and keystream from the key
+  const perm = fibQPermutation(total, params.fibStart);
+  const ks   = genChaosStream(total * 3, params.x0, params.r);
+
+  // Decrypt: inverse of encrypt
+  // For encrypt: out[perm[i]] = (src[i] + ks[i]) mod 256
+  // So for decrypt: src is encrypted, we want original at index i:
+  // original[i] = (enc[perm[i]] - ks[i]) mod 256
+  for(let i=0;i<total;i++){
+    const encIdx = perm[i];
+    const ksBase = i * 3;
+
+    const r = (src[encIdx*4    ] - ks[ksBase  ] + 256) & 0xFF;
+    const g = (src[encIdx*4 + 1] - ks[ksBase+1] + 256) & 0xFF;
+    const b = (src[encIdx*4 + 2] - ks[ksBase+2] + 256) & 0xFF;
+    const a =  src[encIdx*4 + 3];
+
+    out[i*4    ] = r;
+    out[i*4 + 1] = g;
+    out[i*4 + 2] = b;
+    out[i*4 + 3] = a;
+  }
+
+  return new ImageData(out, w, h);
+}
+
+/* ---------------- UI handlers ---------------- */
+
+fileInp.addEventListener('change', e=>{
+  const f = e.target.files && e.target.files[0];
+  if(!f){
+    alert('Pick an image');
+    return;
+  }
+  const img = new Image();
+  img.onload = ()=>{
+    const maxSize = 512; // you can increase if needed
+    const scale = Math.min(1, maxSize / Math.max(img.width, img.height));
+    const W = Math.floor(img.width * scale);
+    const H = Math.floor(img.height * scale);
+
+    c.width  = W;
+    c.height = H;
+    ctx.drawImage(img, 0, 0, W, H);
+    originalImageData = ctx.getImageData(0,0,W,H);
+    lastEncryptedData = null;
+    info.textContent = `Info: Image loaded (${W}×${H})`;
+  };
+  img.onerror = ()=>{
+    alert('Image load failed (try using Live Server or another browser)');
+  };
+  img.src = URL.createObjectURL(f);
+});
+
+document.getElementById('enc').addEventListener('click', ()=>{
+  if(!originalImageData){
+    alert('Load an image first');
+    return;
+  }
+
+  // ✅ ALWAYS generate a random key here
+  let hex = generateRandomHexKey(16);
+  keyBox.value = hex;
+  info.textContent = 'Info: Random key generated.';
+
+  let params;
+  try{
+    params = deriveParamsFromKey(hex);
+  }catch(err){
+    alert('Key error: ' + err.message);
+    return;
+  }
+
+  const { imageData } = encryptImageData(originalImageData, params);
+  lastEncryptedData = imageData;
+  ctx.putImageData(imageData, 0, 0);
+
+  info.textContent += ' Encryption done (chaos + Fibonacci Q-matrix + modular addition).';
+});
+
+document.getElementById('dec').addEventListener('click', ()=>{
+  let srcData = null;
+  if(lastEncryptedData){
+    srcData = lastEncryptedData;
+  }else if(c.width && c.height){
+    srcData = ctx.getImageData(0,0,c.width,c.height);
+  }
+
+  if(!srcData){
+    alert('No encrypted image to decrypt');
+    return;
+  }
+
+  const hex = keyBox.value.trim();
+  if(!hex){
+    alert('Enter the key used for encryption');
+    return;
+  }
+
+  let params;
+  try{
+    params = deriveParamsFromKey(hex);
+  }catch(err){
+    alert('Invalid key: ' + err.message);
+    return;
+  }
+
+  const dec = decryptImageData(srcData, params);
+  ctx.putImageData(dec, 0, 0);
+  info.textContent = 'Info: Decryption done (same key, same chaos + Fibonacci Q-matrix).';
+});
+
+document.getElementById('dlKey').addEventListener('click', ()=>{
+  const hex = keyBox.value.trim();
+  if(!hex){
+    alert('No key to download');
+    return;
+  }
+  const blob = new Blob([JSON.stringify({keyHex:hex},null,2)],{type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'image_key.key';
+  a.click();
+});
+
+document.getElementById('keyfile').addEventListener('change', e=>{
+  const f = e.target.files && e.target.files[0];
+  if(!f) return;
+  f.text().then(txt=>{
+    try{
+      const obj = JSON.parse(txt);
+      if(obj.keyHex){
+        keyBox.value = obj.keyHex;
+      }else{
+        keyBox.value = txt.trim();
+      }
+      info.textContent = 'Info: Key file loaded.';
+    }catch{
+      keyBox.value = txt.trim();
+      info.textContent = 'Info: Raw key text loaded.';
+    }
+  });
+});
+
+document.getElementById('downEnc').addEventListener('click', ()=>{
+  if(!lastEncryptedData && c.width && c.height){
+    // try current canvas
+    lastEncryptedData = ctx.getImageData(0,0,c.width,c.height);
+  }
+  if(!lastEncryptedData){
+    alert('No encrypted image to download');
+    return;
+  }
+  const tmp = document.createElement('canvas');
+  tmp.width  = lastEncryptedData.width;
+  tmp.height = lastEncryptedData.height;
+  tmp.getContext('2d').putImageData(lastEncryptedData,0,0);
+  const url = tmp.toDataURL('image/png');
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'encrypted.png';
+  a.click();
+});
+</script>
+</body>
+</html>
